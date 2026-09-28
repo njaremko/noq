@@ -499,6 +499,12 @@ impl Drop for EndpointDriver {
         // connections.
         endpoint.recv_state.connections.senders.clear();
         endpoint.recv_state.connections.active_connections = 0;
+        // The counters above were just changed to their terminal values, but
+        // `wait_all_draining` and `wait_idle` only re-read them after being
+        // notified. Without these, a caller already parked on either notify is
+        // never woken: the driver is gone and nothing else can signal them.
+        self.0.shared.all_draining.notify_waiters();
+        self.0.shared.idle.notify_waiters();
     }
 }
 
