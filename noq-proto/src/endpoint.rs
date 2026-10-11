@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map},
+    collections::{HashMap, HashSet, VecDeque, hash_map},
     convert::TryFrom,
     fmt, mem,
     net::{IpAddr, SocketAddr},
@@ -20,7 +20,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     coding::{BufMutExt, Decodable, Encodable, UnexpectedEnd},
     config::{ClientConfig, EndpointConfig, ServerConfig},
-    connection::{Connection, ConnectionError, SideArgs},
+    connection::{Connection, ConnectionError, RttEstimator, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
@@ -50,6 +50,8 @@ pub struct Endpoint {
     allow_mtud: bool,
     /// Time at which a stateless reset was most recently sent
     last_stateless_reset: Option<Instant>,
+    /// Time at which a datagram was most recently handled
+    last_datagram: Option<Instant>,
     /// Buffered Initial and 0-RTT messages for pending incoming connections
     incoming_buffers: Slab<IncomingBuffer>,
     all_incoming_buffers_total_bytes: u64,
@@ -77,6 +79,7 @@ impl Endpoint {
             server_config,
             allow_mtud,
             last_stateless_reset: None,
+            last_datagram: None,
             incoming_buffers: Slab::new(),
             all_incoming_buffers_total_bytes: 0,
         }
@@ -135,6 +138,9 @@ impl Endpoint {
             Drained => {
                 if let Some(conn) = self.connections.try_remove(ch.0) {
                     self.index.remove(&conn);
+                    if conn.side.is_server() {
+                        self.keep_drained_initial_cids(&conn);
+                    }
                 } else {
                     // This indicates a bug in downstream code, which could cause spurious
                     // connection loss instead of this error if the CID was (re)allocated prior to
@@ -146,6 +152,37 @@ impl Endpoint {
         None
     }
 
+    /// Keep discarding the initial packets of a server connection that has drained
+    ///
+    /// A client may send its handshake datagrams over several network paths. A copy that took a
+    /// path the connection never saw can arrive after the connection has drained, because the
+    /// connection drains three PTOs of the paths it knew after it closes. A copy of the first
+    /// flight would begin a handshake that its client never answers.
+    ///
+    /// The DCID identifies the copies. A client addresses its first flight to an unpredictable
+    /// DCID that it chooses for each connection attempt, and its later initial packets to the
+    /// first CID the server chose (RFC 9000 §7.2).
+    ///
+    /// RFC 9000 §10.2 has a closed connection discard delayed packets for three PTOs. For a path
+    /// without an RTT sample that is the PTO of the initial RTT (RFC 9002 §6.2.2). It is counted
+    /// from the datagram this endpoint handled most recently, which is no earlier than the last
+    /// one received for the connection.
+    fn keep_drained_initial_cids(&mut self, conn: &ConnectionMeta) {
+        // Without a server configuration no initial packet begins a connection.
+        let (Some(last_datagram), Some(server_config)) = (self.last_datagram, &self.server_config)
+        else {
+            return;
+        };
+        let pto = RttEstimator::new(server_config.transport.initial_rtt).pto_base();
+        let until = last_datagram + 3 * pto;
+        let drained = &mut self.index.drained_initial_cids;
+        drained.insert(conn.init_cid, last_datagram, until);
+        let first_path_cids = conn.local_cids.get(&PathId::ZERO);
+        if let Some(&cid) = first_path_cids.and_then(|path| path.cids.get(&0)) {
+            drained.insert(cid, last_datagram, until);
+        }
+    }
+
     /// Process an incoming UDP datagram
     pub fn handle(
         &mut self,
@@ -155,6 +192,8 @@ impl Endpoint {
         data: BytesMut,
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
+        self.last_datagram = self.last_datagram.max(Some(now));
+
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
         let mut event = match PartialDecode::new(
@@ -244,6 +283,11 @@ impl Endpoint {
                 )),
             }
         } else if event.first_decode.initial_header().is_some() {
+            if self.index.drained_initial_cids.contains(dst_cid, now) {
+                debug!("ignoring initial packet for drained connection {}", dst_cid);
+                return None;
+            }
+
             // Potentially create a new connection
 
             self.handle_first_packet(datagram_len, event, network_path, buf)
@@ -1016,6 +1060,10 @@ struct ConnectionIndex {
     ///
     /// Used by the server, not the client.
     connection_ids_initial: HashMap<ConnectionId, RouteDatagramTo>,
+    /// Identifies initial packets that belong to server connections which have drained
+    ///
+    /// Used by the server, not the client.
+    drained_initial_cids: DrainedInitialCids,
     /// Identifies connections based on locally created CIDs
     ///
     /// Uses a cheaper hash function since keys are locally created
@@ -1156,6 +1204,45 @@ impl ConnectionIndex {
             .get(network_path.remote, &data[data.len() - RESET_TOKEN_SIZE..])
             .cloned()
             .map(|ch| RouteDatagramTo::Connection(ch, PathId::ZERO))
+    }
+}
+
+/// DCIDs of the initial packets of server connections that have drained, each kept until a
+/// given time
+///
+/// Every call first releases, from the oldest on, the entries whose time has passed. While
+/// the retention time stays the same, that leaves at most two entries for each connection that
+/// drained within one retention time of the most recent call.
+#[derive(Default, Debug)]
+struct DrainedInitialCids {
+    /// Uses a standard `HashSet` to protect against hash collision attacks.
+    cids: HashSet<ConnectionId>,
+    /// The members of `cids` with the time each is kept until, in the order they were added
+    kept_until: VecDeque<(Instant, ConnectionId)>,
+}
+
+impl DrainedInitialCids {
+    /// Keep `cid` until `until`, having first forgotten the entries that ended by `now`
+    fn insert(&mut self, cid: ConnectionId, now: Instant, until: Instant) {
+        self.expire(now);
+        if !cid.is_empty() && self.cids.insert(cid) {
+            self.kept_until.push_back((until, cid));
+        }
+    }
+
+    /// Whether `cid` is kept at `now`
+    fn contains(&mut self, cid: ConnectionId, now: Instant) -> bool {
+        self.expire(now);
+        self.cids.contains(&cid)
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while let Some(&(until, cid)) = self.kept_until.front()
+            && until <= now
+        {
+            self.kept_until.pop_front();
+            self.cids.remove(&cid);
+        }
     }
 }
 

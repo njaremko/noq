@@ -22,23 +22,24 @@ use tracing::info;
 
 use crate::{
     AckFrequencyConfig, ApplicationClose, ClientConfig, Connection, ConnectionClose,
-    ConnectionError, ConnectionHandle, DEFAULT_SUPPORTED_VERSIONS, Datagram, DatagramEvent, Dir,
-    Duration, Endpoint, EndpointConfig, Event, FinishError, FourTuple, HashedConnectionIdGenerator,
-    Instant, MIN_INITIAL_SIZE, PathEvent, PathId, ReadError, ReadableError, RecvStream,
-    SendDatagramError, ServerConfig,
+    ConnectionError, ConnectionHandle, ConnectionId, DEFAULT_SUPPORTED_VERSIONS, Datagram,
+    DatagramEvent, Dir, Duration, Endpoint, EndpointConfig, Event, FinishError, FourTuple,
+    HashedConnectionIdGenerator, Instant, MIN_INITIAL_SIZE, PathEvent, PathId, ReadError,
+    ReadableError, RecvStream, SendDatagramError, ServerConfig,
     Side::*,
     StreamEvent, Transmit, TransportConfig, TransportErrorCode, VarInt, WriteError,
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     coding::{Decodable, Encodable},
     crypto::rustls::{QuicServerConfig, configured_provider},
     frame::{self, Frame, FrameStruct},
+    packet::{FixedLengthConnectionIdParser, PartialDecode},
     transport_parameters::TransportParameters,
 };
 
 mod util;
 pub(crate) use util::subscribe;
 use util::{
-    CERTIFIED_KEY, ConnPair, DEFAULT_MTU, IncomingConnectionBehavior, Pair, client_config,
+    CERTIFIED_KEY, ConnPair, DEFAULT_MTU, Inbound, IncomingConnectionBehavior, Pair, client_config,
     client_config_with_certs, client_config_with_deterministic_pns, client_crypto_with_alpn,
     server_config, server_config_with_cert, server_crypto_with_alpn, validate_incoming,
 };
@@ -162,6 +163,168 @@ fn lifecycle() {
     assert_eq!(pair.client.known_cids(), 0);
     assert_eq!(pair.server.known_connections(), 0);
     assert_eq!(pair.server.known_cids(), 0);
+}
+
+/// Connects, and returns the client's handle with every datagram the server received from it.
+fn connect_capturing_client_datagrams(pair: &mut Pair) -> (ConnectionHandle, Vec<Inbound>) {
+    let client_ch = pair.begin_connect(client_config());
+    let mut datagrams = Vec::new();
+    loop {
+        let delivered = pair.server.inbound.len();
+        pair.drive_client();
+        let sent = pair.server.inbound.iter().skip(delivered);
+        datagrams.extend(sent.map(|inbound| Inbound {
+            recv_time: inbound.recv_time,
+            ecn: inbound.ecn,
+            packet: inbound.packet.clone(),
+            remote: inbound.remote,
+            dst_ip: inbound.dst_ip,
+        }));
+        pair.drive_server();
+        if (pair.client.is_idle() && pair.server.is_idle()) || !pair.advance_time() {
+            break;
+        }
+    }
+    let server_ch = pair.server.assert_accept();
+    pair.finish_connect(client_ch, server_ch);
+    (client_ch, datagrams)
+}
+
+/// Closes from the client and drives both sides until the server has drained.
+fn close_and_drain(pair: &mut Pair, client_ch: ConnectionHandle) {
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.server.known_connections(), 0);
+}
+
+/// Delivers copies of `datagrams` to the server now, as if they had taken another path.
+fn deliver_copies(pair: &mut Pair, datagrams: &[Inbound]) {
+    let other_path = SocketAddr::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 1, 2).into(), 1);
+    assert_ne!(other_path, Pair::CLIENT_ADDR);
+    for inbound in datagrams {
+        pair.server.inbound.push_back(Inbound {
+            recv_time: pair.time,
+            ecn: inbound.ecn,
+            packet: inbound.packet.clone(),
+            remote: other_path,
+            dst_ip: inbound.dst_ip,
+        });
+    }
+    pair.drive_server();
+}
+
+/// The DCID of the first packet in `datagram`, which must have a long header.
+fn long_header_dst_cid(datagram: &Inbound) -> ConnectionId {
+    let (packet, _) = PartialDecode::new(
+        datagram.packet.clone(),
+        &FixedLengthConnectionIdParser::new(0),
+        DEFAULT_SUPPORTED_VERSIONS,
+        true,
+    )
+    .unwrap();
+    assert!(packet.has_long_header());
+    packet.dst_cid()
+}
+
+/// A client may send its handshake datagrams over several paths. Copies that take a slower path
+/// can arrive after a short connection has closed and drained. They belong to that connection:
+/// the client will never answer a handshake begun from one.
+#[test]
+fn handshake_copies_after_drain_are_not_a_connection_attempt() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, datagrams) = connect_capturing_client_datagrams(&mut pair);
+    close_and_drain(&mut pair, client_ch);
+
+    deliver_copies(&mut pair, &datagrams);
+    pair.server.assert_no_accept();
+    assert_eq!(pair.server.known_connections(), 0);
+
+    info!("connecting again");
+    pair.connect();
+    assert_eq!(pair.server.known_connections(), 1);
+}
+
+/// After its first flight a client addresses its initial packets to the CID the server chose.
+/// A late copy of one cannot be decrypted with keys derived from that CID, so whether it began
+/// a connection attempt used to depend on the bits its header happened to decode to. A
+/// well-formed initial packet for that CID shows the rule.
+#[test]
+fn initial_for_drained_server_cid_is_not_a_connection_attempt() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, datagrams) = connect_capturing_client_datagrams(&mut pair);
+    let chosen_by_client = long_header_dst_cid(&datagrams[0]);
+    let chosen_by_server = datagrams
+        .iter()
+        .map(long_header_dst_cid)
+        .find(|cid| *cid != chosen_by_client)
+        .unwrap();
+    close_and_drain(&mut pair, client_ch);
+
+    let mut config = client_config();
+    config.initial_dst_cid_provider(Arc::new(move || chosen_by_server));
+    pair.begin_connect(config);
+    pair.drive_client();
+    pair.drive_server();
+    pair.server.assert_no_accept();
+}
+
+/// The server discards such copies for three PTOs of a path whose RTT it never measured,
+/// counted from the last datagram it handled. After that it has forgotten the connection, and
+/// a copy of the first flight is an initial packet like any other.
+#[test]
+fn drained_initial_cids_are_kept_for_three_initial_ptos() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, datagrams) = connect_capturing_client_datagrams(&mut pair);
+    let first_flight = &datagrams[..1];
+    // The client's close is the last datagram the server handles.
+    let closed_at = pair.time;
+    close_and_drain(&mut pair, client_ch);
+    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+    // RFC 9002 §6.2.2: an initial RTT of 333 ms, and a variance of half of it.
+    let initial_pto = Duration::from_millis(333 + 4 * 333 / 2);
+
+    pair.time = closed_at + 3 * initial_pto - Duration::from_millis(1);
+    deliver_copies(&mut pair, first_flight);
+    assert!(pair.server.waiting_incoming.is_empty());
+
+    pair.time = closed_at + 3 * initial_pto;
+    deliver_copies(&mut pair, first_flight);
+    let incoming = pair.server.waiting_incoming.pop().unwrap();
+    assert!(pair.server.waiting_incoming.is_empty());
+    pair.server.ignore(incoming);
+}
+
+/// With zero-length CIDs, a client addresses its initial packets after a Retry to an empty CID.
+/// An empty CID identifies no connection, so a drained connection does not have them discarded.
+#[test]
+fn drained_connection_with_empty_cids_discards_no_initial() {
+    let _guard = subscribe();
+    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+        || Box::new(RandomConnectionIdGenerator::new(0));
+    let mut pair = Pair::new(
+        Arc::new(EndpointConfig {
+            connection_id_generator_factory: Arc::new(cid_generator_factory),
+            ..EndpointConfig::default()
+        }),
+        server_config(),
+    );
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let (client_ch, _) = pair.connect();
+    close_and_drain(&mut pair, client_ch);
+
+    let reconnecting_at = pair.time;
+    pair.connect();
+    // RFC 9002 §6.2.2: the client would retransmit a discarded initial packet after the initial
+    // PTO, an initial RTT of 333 ms plus four times a variance of half of it.
+    let initial_pto = Duration::from_millis(333 + 4 * 333 / 2);
+    assert!(pair.time - reconnecting_at < initial_pto);
 }
 
 #[test]
